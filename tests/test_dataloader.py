@@ -177,6 +177,8 @@ def test_cp_behavior(TP_SIZE, CP_SIZE, PP_SIZE, DP_SIZE, SEQ_LEN=8):
         end_idx = start_idx + split_size
         assert torch.equal(ref_batch["input_ids"][:,start_idx:end_idx], batch["input_ids"]), "input_ids are not equal"
 
+    print("test_cp_behavior passed")
+
 # test the infinite loop behavior
 def test_infinite_loop():
     local_rank = 0

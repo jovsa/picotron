@@ -25,10 +25,10 @@ pip install -e .
 - GPU
     ```sh
     # To create a config file in json format under tmp by default
-    python create_config.py --out_dir tmp --exp_name llama-1B --dp 8 --model_name HuggingFaceTB/SmolLM-1.7B --num_hidden_layers 15  --grad_acc_steps 32 --mbs 4 --seq_len 1024 --hf_token <HF_TOKEN>
+    python create_config.py --out_dir tmp --exp_name Smollm-1B --dp 2 --model_name HuggingFaceTB/SmolLM-1.7B --num_hidden_layers 5  --grad_acc_steps 32 --mbs 4 --seq_len 1024 --hf_token  <HF_TOKEN>
 
     # Locally
-    torchrun --nproc_per_node 8 train.py --config tmp/llama-1B/config.json 
+    torchrun --nproc_per_node 2 train.py --config tmp/Smollm-1B/config.json
 
     # 3D Parallelism
     python create_config.py --out_dir tmp --dp 4 --tp 2 --pp 2 --pp_engine 1f1b --exp_name llama-7B --model_name meta-llama/Llama-2-7b-hf  --grad_acc_steps 32 --mbs 4 --seq_len 1024 --hf_token <HF_TOKEN>

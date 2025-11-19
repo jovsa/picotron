@@ -30,14 +30,14 @@ PICOTRON CODEBASE
 │   │   │   ├── 8. Move to device & dtype
 │   │   │   └── 9. Apply Data Parallel (if dp_size > 1)
 │   │   ├── Training Loop
+│   │   │   ├── Pipeline Parallel Training
+│   │   │   │   ├── AFAB (All-Forward-All-Backward)
+│   │   │   │   └── 1F1B (One-Forward-One-Backward)
 │   │   │   ├── Standard Training Step
 │   │   │   │   ├── Gradient accumulation loop
 │   │   │   │   ├── Forward pass
 │   │   │   │   ├── Loss computation
 │   │   │   │   └── Backward pass
-│   │   │   ├── Pipeline Parallel Training
-│   │   │   │   ├── AFAB (All-Forward-All-Backward)
-│   │   │   │   └── 1F1B (One-Forward-One-Backward)
 │   │   │   ├── Loss averaging (across DP/CP ranks)
 │   │   │   ├── Optimizer step
 │   │   │   └── Metrics calculation (MFU, throughput)

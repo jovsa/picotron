@@ -30,6 +30,7 @@ def train_step(model, data_loader, device):
     acc_loss = 0.0
 
     requires_grad_sync = pgm.process_group_manager.cp_dp_world_size > 1
+    # Gradient accumulation loop
     for i in range(data_loader.grad_acc_steps):
         # get the next batch
         batch = next(data_loader)
@@ -40,14 +41,16 @@ def train_step(model, data_loader, device):
         if requires_grad_sync:
             model.require_backward_grad_sync = (i == data_loader.grad_acc_steps - 1)
 
+        # Forward pass
         outputs = model(input_ids=input_ids)
 
-        # compute the loss
+        # Loss computation
         batch_size, seq_len = input_ids.shape
         target_ids = target_ids.reshape(-1)
         outputs = outputs.view(seq_len*batch_size, -1)
         loss = F.cross_entropy(outputs, target_ids, reduction='mean') / data_loader.grad_acc_steps
 
+        # Backward pass
         loss.backward()
 
         acc_loss += loss.item()
@@ -59,9 +62,14 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="", help="Path to config file")
     args = parser.parse_args()
 
+    # ========================================================================
+    # Configuration Loading
+    # ========================================================================
+    # JSON config parsing
     with open(args.config, "r") as f:
         config = json.load(f)
 
+    # Environment variable setup
     os.environ["OMP_NUM_THREADS"] = config["environment"]["OMP_NUM_THREADS"]
     os.environ["TOKENIZERS_PARALLELISM"] = config["environment"]["TOKENIZERS_PARALLELISM"]
     os.environ["FLASH_ATTEN"] = config["environment"]["FLASH_ATTEN"]
@@ -76,15 +84,20 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not config["distributed"]["use_cpu"] else torch.float32
     assert (dtype == torch.bfloat16 and os.getenv("FLASH_ATTEN") == "1") or os.getenv("FLASH_ATTEN") != "1", "Kernel operations requires dtype=torch.bfloat16"
 
+    # ========================================================================
+    # Distributed Setup
+    # ========================================================================
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
+    # Process group initialization (NCCL/Gloo)
     backend = "gloo" if config["distributed"]["use_cpu"] else "nccl"
 
     assert config["training"]["seq_length"] % config["distributed"]["cp_size"] == 0, "seq_length must be divisible by cp_size for Context Parallelism"
     assert world_size == config["distributed"]["tp_size"] * config["distributed"]["pp_size"] * config["distributed"]["dp_size"] * config["distributed"]["cp_size"], "world_size must be equal to tp_size * pp_size * dp_size * cp_size"
 
+    # Device assignment (CUDA/CPU)
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
@@ -149,7 +162,11 @@ if __name__ == "__main__":
             },
         )
 
+    # ========================================================================
+    # Model Initialization Flow
+    # ========================================================================
     if pgm.process_group_manager.global_rank == 0:
+        # 1. Create model config (rank 0)
         print(f"rank {pgm.process_group_manager.global_rank}: Creating model config")
         model_config = AutoConfig.from_pretrained(config["model"]["name"])
         # twist the model structure if specified in the config file
@@ -161,6 +178,7 @@ if __name__ == "__main__":
     else:
         objects = [None]
 
+    # 2. Broadcast config to all ranks
     dist.broadcast_object_list(objects, src=0, device=device)
     model_config = objects[0]
     print(f"rank {pgm.process_group_manager.global_rank}: Broadcasting model_config to all ranks", is_print_rank=pgm.process_group_manager.global_rank==0)
@@ -171,24 +189,31 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
+    # 3. Initialize with dematerialized weights (meta device)
     with init_model_with_dematerialized_weights():
         model = Llama(config=model_config)
 
+        # 4. Apply Tensor Parallel (if tp_size > 1)
         if pgm.process_group_manager.tp_world_size > 1:
             model = apply_tensor_parallel(model)
 
+        # 5. Apply Pipeline Parallel (if pp_size > 1)
         if pgm.process_group_manager.pp_world_size > 1:
             model = PipelineParallel(model, model_config)
 
+    # 6. Materialize weights from checkpoint
     model = init_model_with_materialized_weights(model, model_config, save_dir=f"./hf_model_safetensors/")
 
     #TODO: load existing checkpoint here to continue pre-training
 
+    # 7. Apply Context Parallel (if cp_size > 1)
     if pgm.process_group_manager.cp_world_size > 1:
         model = apply_context_parallel(model)
 
+    # 8. Move to device & dtype
     model.to(dtype).to(device)
 
+    # 9. Apply Data Parallel (if dp_size > 1)
     if pgm.process_group_manager.dp_world_size > 1:
         model = DataParallelBucket(model)
 
@@ -216,22 +241,31 @@ if __name__ == "__main__":
 
     dist.barrier()
 
+    # ========================================================================
+    # Training Loop
+    # ========================================================================
     while config["training"]["max_tokens"] is None or trained_tokens < config["training"]["max_tokens"]:
         step_start_time = time.time()
         optimizer.zero_grad()
 
+        # Pipeline Parallel Training
         if pgm.process_group_manager.pp_world_size > 1:
+            # AFAB (All-Forward-All-Backward)
             if config["distributed"]["pp_engine"] == "afab":
                 loss = train_step_pipeline_afab(model, data_loader, tensor_shapes, device, dtype)
+            # 1F1B (One-Forward-One-Backward)
             elif config["distributed"]["pp_engine"] == "1f1b":
                 loss = train_step_pipeline_1f1b(model, data_loader, tensor_shapes, device, dtype)
             else:
                 raise ValueError(f"Invalid pipeline parallel engine: {config['distributed']['pp_engine']}")
         else:
+            # Standard Training Step
             loss = train_step(model, data_loader, device)
 
+        # Loss averaging (across DP/CP ranks)
         loss = average_loss_across_dp_cp_ranks(loss, device)
 
+        # Optimizer step
         optimizer.step()
         trained_tokens += tokens_per_step
         step += 1
@@ -239,11 +273,13 @@ if __name__ == "__main__":
         if hasattr(model, 'reset'):
             model.reset()
 
+        # Metrics calculation (MFU, throughput)
         step_duration = time.time() - step_start_time
         tokens_per_second = tokens_per_step / step_duration
         tokens_per_second_per_gpu = tokens_per_second / world_size
         mfu = get_mfu(tokens_per_second_per_gpu, num_params, model_config)
 
+        # Checkpointing & Logging
         if is_wandb_rank:
             print(
                 f"[rank {pgm.process_group_manager.global_rank}] "

@@ -9,11 +9,25 @@ Instructions to run the tests:
 1. Run with standard unittest (uses torch.multiprocessing):
    python tests/test_process_group_manager.py
 
-2. Run with torchrun (simulates distributed environment):
-   torchrun --nproc_per_node=4 tests/test_process_group_manager.py \
-       --tp_size 2 --dp_size 2
+   - When invoked with `python tests/test_process_group_manager.py`, the `unittest`
+  runner executes the TestProcessGroupManager class (lines 145-180). Each test uses
+  `torch.multiprocessing.spawn` to create multiple ranks within a single process.
+  This lets developers or CI run the distributed tests without needing torchrun.
 
-   Note: Ensure that tp_size * cp_size * pp_size * dp_size == nproc_per_node
+
+2. Run with torchrun (simulates distributed environment):
+   torchrun --nproc_per_node=2 tests/test_process_group_manager.py \
+       --tp_size 1 --dp_size 2
+
+    - When invoked via `torchrun`, PyTorch sets `RANK` and other env vars. The block in
+  `if __name__ == "__main__"` detects that and executes once per rank, mimicking the
+  actual distributed training runtime. In this mode the TestProcessGroupManager class
+  is skipped entirely and `check_pgm_state` runs directly in each spawned process.
+
+
+   Note: Ensure that tp_size * cp_size * pp_size * dp_size == nproc_per_node.
+   For unittest runs you can limit local ranks by exporting `PGM_TEST_MAX_PROCS`
+   (default: 2, which matches dual-GPU hosts).
 """
 
 # Ensure picotron is in the path
@@ -27,6 +41,8 @@ from picotron.process_group_manager import (  # noqa: E402
     setup_process_group_manager
 )
 import picotron.process_group_manager as pgm  # noqa: E402
+
+MAX_LOCAL_PROCS = int(os.environ.get("PGM_TEST_MAX_PROCS", 2))
 
 
 def check_pgm_state(tp_size, cp_size, pp_size, dp_size):
@@ -143,40 +159,68 @@ def run_test_worker(rank, world_size, tp_size, cp_size, pp_size, dp_size):
 
 
 class TestProcessGroupManager(unittest.TestCase):
-    def test_tp_dp(self):
-        print("\n=== Running test_tp_dp (TP=2, DP=2) ===")
-        # TP=2, DP=2 -> World=4
-        tp, cp, pp, dp = 2, 1, 1, 2
+    def _launch_config(self, description, tp, cp, pp, dp):
         world_size = tp * cp * pp * dp
+        print(f"\n=== Running {description} (world={world_size}) ===")
         mp.spawn(
             run_test_worker,
             args=(world_size, tp, cp, pp, dp),
             nprocs=world_size,
             join=True
+        )
+
+    def _run_best_fit(self, configs, skip_message):
+        viable = []
+        for description, tp, cp, pp, dp in configs:
+            world_size = tp * cp * pp * dp
+            if world_size <= MAX_LOCAL_PROCS:
+                viable.append((world_size, description, tp, cp, pp, dp))
+
+        if not viable:
+            self.skipTest(skip_message)
+
+        # Prefer the largest topology that still fits on the host.
+        viable.sort(key=lambda item: item[0], reverse=True)
+        _, description, tp, cp, pp, dp = viable[0]
+        self._launch_config(description, tp, cp, pp, dp)
+
+    def test_tp_dp(self):
+        configs = [
+            ("test_tp_dp (TP=2, DP=2)", 2, 1, 1, 2),
+            ("test_tp_only (TP=2, DP=1)", 2, 1, 1, 1),
+            ("test_dp_only (TP=1, DP=2)", 1, 1, 1, 2),
+        ]
+
+        self._run_best_fit(
+            configs,
+            f"No TP/DP configuration fits within MAX_LOCAL_PROCS={MAX_LOCAL_PROCS}"
         )
 
     def test_pp_dp(self):
-        print("\n=== Running test_pp_dp (PP=2, DP=2) ===")
-        # PP=2, DP=2 -> World=4
-        tp, cp, pp, dp = 1, 1, 2, 2
-        world_size = tp * cp * pp * dp
-        mp.spawn(
-            run_test_worker,
-            args=(world_size, tp, cp, pp, dp),
-            nprocs=world_size,
-            join=True
+        configs = [
+            ("test_pp_dp (PP=2, DP=2)", 1, 1, 2, 2),
+            ("test_pp_only (PP=2, DP=1)", 1, 1, 2, 1),
+            ("test_dp_only (PP=1, DP=2)", 1, 1, 1, 2),
+        ]
+
+        self._run_best_fit(
+            configs,
+            f"No PP/DP configuration fits within MAX_LOCAL_PROCS={MAX_LOCAL_PROCS}"
         )
 
     def test_complex_grid(self):
-        print("\n=== Running test_complex_grid (TP=2, PP=2) ===")
-        # TP=2, PP=2 -> World=4
-        tp, cp, pp, dp = 2, 1, 2, 1
-        world_size = tp * cp * pp * dp
-        mp.spawn(
-            run_test_worker,
-            args=(world_size, tp, cp, pp, dp),
-            nprocs=world_size,
-            join=True
+        configs = [
+            ("test_complex_grid (TP=2, PP=2)", 2, 1, 2, 1),
+            ("test_tp_cp (TP=2, CP=2)", 2, 2, 1, 1),
+            ("test_cp_pp (CP=2, PP=2)", 1, 2, 2, 1),
+            ("test_tp_pp (TP=2, PP=1)", 2, 1, 1, 1),
+            ("test_pp_only (TP=1, PP=2)", 1, 1, 2, 1),
+        ]
+
+        self._run_best_fit(
+            configs,
+            ("No complex grid configuration fits within "
+             f"MAX_LOCAL_PROCS={MAX_LOCAL_PROCS}")
         )
 
 
@@ -194,11 +238,13 @@ if __name__ == "__main__":
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+        print(f"world_size: {world_size}, rank: {rank}, local_rank: {local_rank}")
+
         # Replicate train.py initialization flow
         backend = "nccl" if torch.cuda.is_available() else "gloo"
 
         if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
+            torch.cuda.set_device(local_rank % torch.cuda.device_count())
 
         dist.init_process_group(
             backend=backend, rank=rank, world_size=world_size

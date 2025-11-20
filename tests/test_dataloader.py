@@ -1,10 +1,15 @@
 """
 torchrun --nproc_per_node 2 --master_addr localhost --master_port 25500 test_dataloader.py
+
+Instructions to run the tests:
+PYTHONPATH=/workspace/picotron torchrun --nproc_per_node 2 --master_addr localhost --master_port 25500 tests/test_dataloader.py
+
 """
 from picotron.data import MicroBatchDataLoader
 import torch.distributed as dist
 import os
 import datetime
+import time
 from picotron.process_group_manager import setup_process_group_manager
 
 import torch
@@ -134,13 +139,37 @@ class DummyDataLoader(DataLoader):
 
 # test the tokens are split correctly in context parallelism
 # TODO: test zigzag behavior
-def test_cp_behavior(TP_SIZE, CP_SIZE, PP_SIZE, DP_SIZE, SEQ_LEN=8):
+def test_cp_behavior(TP_SIZE, CP_SIZE, PP_SIZE, DP_SIZE, SEQ_LEN=8, master_port=None):
+    # Disable NCCL P2P for this test
+    os.environ["NCCL_P2P_DISABLE"] = "1"
+
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     backend = "nccl"
 
     assert SEQ_LEN % CP_SIZE == 0, "SEQ_LEN must be divisible by cp_size for Context Parallelism"
+    assert TP_SIZE * CP_SIZE * PP_SIZE * DP_SIZE == world_size, "TP_SIZE * CP_SIZE * PP_SIZE * DP_SIZE must be equal to world_size"
+
+    # Check if process group is already initialized and destroy it if needed
+    if dist.is_initialized():
+        # Synchronize and cleanup before destroying
+        dist.barrier()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        dist.destroy_process_group()
+        # Small delay to ensure NCCL resources are fully released
+        time.sleep(1.0)  # Increased delay
+
+    # Use a unique master port for each test to avoid conflicts
+    if master_port is not None:
+        os.environ["MASTER_PORT"] = str(master_port)
+
+    # Set CUDA device before initializing process group
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
     dist.init_process_group(rank=global_rank, world_size=world_size, backend=backend, init_method="env://", timeout=datetime.timedelta(minutes=3))
     setup_process_group_manager(tp_size=TP_SIZE, cp_size=CP_SIZE, pp_size=PP_SIZE, dp_size=DP_SIZE)
 
@@ -173,45 +202,23 @@ def test_cp_behavior(TP_SIZE, CP_SIZE, PP_SIZE, DP_SIZE, SEQ_LEN=8):
         ref_batch = next(ref_data_loader)
         batch = next(data_loader)
         split_size = ref_batch["input_ids"].shape[1] // pgm.process_group_manager.cp_world_size
-        start_idx = split_size * global_rank
+        start_idx = split_size * pgm.process_group_manager.cp_rank
         end_idx = start_idx + split_size
         assert torch.equal(ref_batch["input_ids"][:,start_idx:end_idx], batch["input_ids"]), "input_ids are not equal"
 
-    print("test_cp_behavior passed")
+    print(f"test_cp_behavior passed for TP_SIZE={TP_SIZE}, CP_SIZE={CP_SIZE}, PP_SIZE={PP_SIZE}, DP_SIZE={DP_SIZE}, SEQ_LEN={SEQ_LEN}")
 
-# test the infinite loop behavior
-def test_infinite_loop():
-    local_rank = 0
-    global_rank = 0
-    world_size = 1
-    backend = "nccl"
-
-    dist.init_process_group(rank=global_rank, world_size=world_size, backend=backend, init_method="env://", timeout=datetime.timedelta(minutes=3))
-    setup_process_group_manager(tp_size=1, cp_size=1, pp_size=1, dp_size=1)
-
-    data_loader = MicroBatchDataLoader(
-        micro_batch_size=2,
-        seq_length=256,
-        dataset_name="roneneldan/TinyStories",
-        tokenizer_name="HuggingFaceTB/SmolLM-135M",
-        grad_acc_steps=1,
-        device=f"cuda:{local_rank}",
-        num_workers=1,
-        num_proc=1,
-        num_samples=2,
-    )
-
-    s = set()
-    for _ in range(10):
-        batch = next(data_loader)
-        # Convert the nested list to a tuple of tuples
-        batch_tuple = tuple(tuple(x) for x in batch["input_ids"].tolist())
-        if batch_tuple in s:
-            assert True
-        s.add(batch_tuple)
-    assert False
+    # Cleanup: synchronize all ranks, clear CUDA cache, then destroy process group
+    dist.barrier()  # Ensure all ranks finish before cleanup
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    dist.destroy_process_group()
+    pgm.process_group_manager = None
 
 
 if __name__ == "__main__":
-    # test_infinite_loop()
-    test_cp_behavior(TP_SIZE=1, CP_SIZE=2, PP_SIZE=1, DP_SIZE=1, SEQ_LEN=8)
+    # test_cp_behavior(TP_SIZE=2, CP_SIZE=1, PP_SIZE=1, DP_SIZE=1, SEQ_LEN=8)
+    # test_cp_behavior(TP_SIZE=1, CP_SIZE=2, PP_SIZE=1, DP_SIZE=1, SEQ_LEN=8)
+    # test_cp_behavior(TP_SIZE=1, CP_SIZE=1, PP_SIZE=2, DP_SIZE=1, SEQ_LEN=8)
+    test_cp_behavior(TP_SIZE=1, CP_SIZE=1, PP_SIZE=1, DP_SIZE=2, SEQ_LEN=8)

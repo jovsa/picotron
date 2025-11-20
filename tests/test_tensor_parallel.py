@@ -1,6 +1,9 @@
 """
 CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --nproc_per_node 4 --master_addr localhost --master_port 25500 test_tensor_parallel.py
 CUDA_DEVICE_MAX_CONNECTIONS=1 debugpy-run -p 5678 -m torch.distributed.run -- --nproc_per_node=2 --nnodes=1 --rdzv_backend=c10d --rdzv_endpoint=localhost:29400 test_tensor_parallel.py
+
+
+PYTHONPATH=/workspace/picotron torchrun --nproc_per_node 2 --master_addr localhost --master_port 25500 tests/test_tensor_parallel.py
 """
 
 from picotron.process_group_manager import setup_process_group_manager
@@ -28,7 +31,7 @@ bias = True                 # linear layer with/without bias
 async_all_reduce = False    # async all-reduce or not for column parallel linear layer
 
 # Initialize input tensor
-tensor_shape = (batch_size, seq_len, input_size) 
+tensor_shape = (batch_size, seq_len, input_size)
 tensor = torch.randn(tensor_shape, device=device, requires_grad=True)
 column_parallel_tensor = tensor.clone().detach().requires_grad_(True)
 row_parallel_tensor = tensor.clone().chunk(world_size, dim=-1)[local_rank].detach().requires_grad_(True)
@@ -43,7 +46,7 @@ column_parallel_linear.weight = torch.nn.Parameter(linear_layer.weight.chunk(wor
 row_parallel_linear.weight = torch.nn.Parameter(linear_layer.weight.chunk(world_size, dim=1)[local_rank])
 if bias:
     column_parallel_linear.bias = torch.nn.Parameter(linear_layer.bias.chunk(world_size, dim=0)[local_rank])
-    row_parallel_linear.bias = torch.nn.Parameter(linear_layer.bias)  
+    row_parallel_linear.bias = torch.nn.Parameter(linear_layer.bias)
 
 ### forward pass ###
 output_reference = linear_layer(tensor)

@@ -8,7 +8,7 @@ You can run these tests in two ways:
    - Each test uses torch.multiprocessing.spawn to create ranks locally.
 
 2. torchrun (mirrors training-time launch, executes one scenario per rank):
-   torchrun --nproc_per_node=2 tests/test_data_parallel.py --scenario naive
+   torchrun --nproc_per_node=2 tests/test_data_parallel.py
 
 Environment variables:
   DP_TEST_MAX_PROCS   -> max world size runnable via unittest (default: 2)
@@ -306,7 +306,8 @@ if __name__ == "__main__":
         parser.add_argument(
             "--scenario",
             choices=SCENARIOS.keys(),
-            required=True,
+            required=False,
+            default="bucket",
             help="Scenario to run when launched with torchrun.",
         )
         args = parser.parse_args()

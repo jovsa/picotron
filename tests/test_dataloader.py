@@ -4,6 +4,11 @@ torchrun --nproc_per_node 2 --master_addr localhost --master_port 25500 test_dat
 Instructions to run the tests:
 PYTHONPATH=/workspace/picotron torchrun --nproc_per_node 2 --master_addr localhost --master_port 25500 tests/test_dataloader.py
 
+Notes:
+* DistributedSampler considers only DP.
+* When checking batch_size we only care about CP
+
+
 """
 from picotron.data import MicroBatchDataLoader
 import torch.distributed as dist

@@ -19,40 +19,40 @@ class DataParallelNaive(nn.Module):
 
         Args:
             module (nn.Module): The model to be wrapped for data parallelism.
-            process_group (torch.distributed.ProcessGroup): The process group used for gradient synchronization. 
+            process_group (torch.distributed.ProcessGroup): The process group used for gradient synchronization.
                                                             It could be a data parallel or context parallel group.
         """
         super().__init__()
         self.module = module
         self.require_backward_grad_sync = True # whether to synchronize gradients during backward pass. Set to False when using gradient accumulation
         self.register_backward_hook(self._allreduce_grads)
-    
+
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
-    
+
     def register_backward_hook(self, hook):
         """
-        Registers a backward hook for all parameters of the model that require gradients.    
+        Registers a backward hook for all parameters of the model that require gradients.
         """
         for p in self.module.parameters():
             if p.requires_grad is True:
                 p.register_post_accumulate_grad_hook(hook)
-                
+
     def _allreduce_grads(self, grad):
         """
-        Performs an all-reduce operation to synchronize gradients across multiple processes.    
+        Performs an all-reduce operation to synchronize gradients across multiple processes.
         """
         # No synchronization needed during gradient accumulation, except at the final accumulation step.
         if self.require_backward_grad_sync:
             dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.cp_dp_group)
             grad /= pgm.process_group_manager.cp_dp_world_size
-        return grad 
-    
+        return grad
+
     @contextlib.contextmanager
     def no_sync(self):
         """
-        A context manager to temporarily disable gradient synchronization. 
-        This is useful for performing multiple backward passes during gradient accumulation without synchronizing 
+        A context manager to temporarily disable gradient synchronization.
+        This is useful for performing multiple backward passes during gradient accumulation without synchronizing
         gradients in between.
         """
         self.require_backward_grad_sync = False
@@ -66,12 +66,12 @@ class DataParallelBucket(nn.Module):
     def __init__(self, module, bucket_cap_mb=25, grad_type = torch.float32):
         """
         Initialize the DataParallelBucket module.
-        
+
         Args:
             module (nn.Module): The model to be parallelized.
-            process_group: The process group for gradient synchronization, which can be either 
+            process_group: The process group for gradient synchronization, which can be either
                            a data parallel group or a context parallel group.
-            bucket_cap_mb (int, optional): The maximum size of each gradient synchronization bucket in megabytes. 
+            bucket_cap_mb (int, optional): The maximum size of each gradient synchronization bucket in megabytes.
                                            Defaults to 25 MB.
             grad_type (torch.dtype, optional): The data type of gradients, defaulting to float32.
         """
@@ -83,23 +83,23 @@ class DataParallelBucket(nn.Module):
         self.bucket_manager = BucketManager(module.parameters(), pgm.process_group_manager.cp_dp_group, bucket_size, grad_type)
         self.register_backward_hook()
         self._post_backward_callback_set = False # whether the callback for wait gradient synchronization is set
-        
+
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
 
     def backward(self, input_tensor, output_tensor, output_tensor_grad):
         return self.module.backward(input_tensor, output_tensor, output_tensor_grad)
-    
+
     def register_backward_hook(self):
         """
         Registers a backward hook to manually accumulate and synchronize gradients.
-        
+
         This hook serves two main purposes:
         1. PyTorch does not natively support gradient accumulation with mixed precision.
         2. After gradient accumulation, it flags parameters as ready for synchronization.
-        
+
         The gradient accumulation functions are stored to prevent them from going out of scope.
-        
+
         References:
         - https://github.com/NVIDIA/Megatron-LM/issues/690
         - https://pytorch.org/docs/stable/generated/torch.autograd.graph.Node.register_hook.html
@@ -114,7 +114,7 @@ class DataParallelBucket(nn.Module):
                 grad_acc_fn = param_tmp.grad_fn.next_functions[0][0]
                 grad_acc_fn.register_hook(self._make_param_hook(param, self.bucket_manager))
                 self.grad_accs.append(grad_acc_fn)
-                
+
     def _make_param_hook(self, param: torch.nn.Parameter,bucket_manager: BucketManager):
         """
         Creates the a hook for each parameter to handle gradient accumulation and synchronization.
@@ -130,7 +130,7 @@ class DataParallelBucket(nn.Module):
                 assert param.grad is not None
                 param.main_grad.add_(param.grad.data) # accumulate the gradients
                 param.grad = None
-                
+
                 # skip the gradient synchronization (gradient accumulation/PP micro batches)
                 if self.require_backward_grad_sync:
                     # Add a callback to wait for gradient synchronization. Ensures the callback is added only once.
@@ -138,23 +138,23 @@ class DataParallelBucket(nn.Module):
                     if not self._post_backward_callback_set:
                         Variable._execution_engine.queue_callback(self._post_backward)
                         self._post_backward_callback_set = True
-                        
-                    # mark the parameter as ready for gradient synchronization. 
-                    bucket_manager.mark_param_as_ready(param) 
+
+                    # mark the parameter as ready for gradient synchronization.
+                    bucket_manager.mark_param_as_ready(param)
         return param_hook
-    
+
     @contextlib.contextmanager
     def no_sync(self):
         """A context manager to disable gradient synchronization."""
         self.require_backward_grad_sync = False
         yield
         self.require_backward_grad_sync = True
-        
+
     def _post_backward(self):
         """
-        A post-backward callback that waits for gradient synchronization to finish, then copies 
+        A post-backward callback that waits for gradient synchronization to finish, then copies
         the synchronized gradients back to the parameters' grad attribute.
-        
+
         This method is called after the backward pass and before the optimizer step.
         """
         self.bucket_manager.wait()
@@ -168,4 +168,4 @@ class DataParallelBucket(nn.Module):
         """
         Reset the bucket manager and zero out gradients in the model
         """
-        self.bucket_manager.reset() 
+        self.bucket_manager.reset()

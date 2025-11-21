@@ -169,3 +169,77 @@ class DataParallelBucket(nn.Module):
         Reset the bucket manager and zero out gradients in the model
         """
         self.bucket_manager.reset()
+
+
+class DataParalleSyncronize(nn.Module):
+    """
+    A simplified data-parallel wrapper that synchronizes gradients at the end of the
+    backward pass by forcing device-wide synchronization followed by a single
+    all-reduce per parameter.
+    """
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.require_backward_grad_sync = True
+        self._post_backward_callback_set = False
+        self._grad_accs = []
+        self._world_size = pgm.process_group_manager.cp_dp_world_size
+        self._process_group = pgm.process_group_manager.cp_dp_group
+        self._register_backward_hooks()
+
+    def forward(self, *inputs, **kwargs):
+        return self.module(*inputs, **kwargs)
+
+    def backward(self, input_tensor, output_tensor, output_tensor_grad):
+        return self.module.backward(input_tensor, output_tensor, output_tensor_grad)
+
+    def _register_backward_hooks(self):
+        for param in self.module.parameters():
+            if not param.requires_grad:
+                continue
+            param_tmp = param.expand_as(param)
+            grad_acc = param_tmp.grad_fn.next_functions[0][0]
+            grad_acc.register_hook(self._make_accumulate_hook())
+            self._grad_accs.append(grad_acc)
+
+    def _make_accumulate_hook(self):
+        def hook(*unused):
+            if self.require_backward_grad_sync and not self._post_backward_callback_set:
+                Variable._execution_engine.queue_callback(self._post_backward)
+                self._post_backward_callback_set = True
+
+        return hook
+
+    def _post_backward(self):
+        self._synchronize_devices()
+        self._all_reduce_grads()
+        self._post_backward_callback_set = False
+
+    def _synchronize_devices(self):
+        devices = {
+            p.device
+            for p in self.module.parameters()
+            if p.requires_grad and p.grad is not None and p.is_cuda
+        }
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    def _all_reduce_grads(self):
+        if self._world_size == 1:
+            return
+        for param in self.module.parameters():
+            if param.requires_grad and param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self._process_group)
+                param.grad /= self._world_size
+
+    @contextlib.contextmanager
+    def no_sync(self):
+        self.require_backward_grad_sync = False
+        yield
+        self.require_backward_grad_sync = True
+
+    def reset(self):
+        for param in self.module.parameters():
+            if param.requires_grad and param.grad is not None:
+                param.grad.zero_()

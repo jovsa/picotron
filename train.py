@@ -21,7 +21,7 @@ from picotron.checkpoint import init_model_with_dematerialized_weights, init_mod
 from picotron.data import MicroBatchDataLoader
 from picotron.process_group_manager import setup_process_group_manager
 from picotron.pipeline_parallel.pipeline_parallel import train_step_pipeline_1f1b, train_step_pipeline_afab, PipelineParallel
-from picotron.data_parallel.data_parallel import DataParallelBucket
+from picotron.data_parallel.data_parallel import DataParallelBucket, DataParalleSyncronize
 from picotron.model import Llama
 from picotron.utils import download_model
 import wandb
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     if is_wandb_rank and config["logging"]["use_wandb"]:
         wandb.init(
             project="picotron",
-            name=f"{config['logging']['run_name']}_{to_readable_format(tokens_per_step)}_{pgm.process_group_manager}",
+            name=f"{config['logging']['run_name']}_{to_readable_format(tokens_per_step)}_{pgm.process_group_manager}_DP_Sync",
             config={
                 "tensor_parallel_size": pgm.process_group_manager.tp_world_size,
                 "context_parallel_size": pgm.process_group_manager.cp_world_size,
@@ -216,6 +216,7 @@ if __name__ == "__main__":
     # 9. Apply Data Parallel (if dp_size > 1)
     if pgm.process_group_manager.dp_world_size > 1:
         model = DataParallelBucket(model)
+        # model = DataParalleSyncronize(model)
 
     print(f"init model parallel time: {time.time()-start_time:.2f}s", is_print_rank=is_wandb_rank)
 
